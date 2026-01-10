@@ -9,8 +9,9 @@ import (
 )
 
 type BroadcastList struct {
-	seen []int
-	mu   sync.Mutex
+	seen     []int
+	neigbors []string
+	mu       sync.Mutex
 }
 
 var broadcastList = BroadcastList{
@@ -59,6 +60,17 @@ func main() {
 		if err := json.Unmarshal(msg.Body, &msgBody); err != nil {
 			return err
 		}
+
+		// Lots of type casting the unmarshalled JSON
+		topology := msgBody["topology"].(map[string]any)
+		neighbors := topology[n.ID()].([]any)
+
+		broadcastList.mu.Lock()
+		broadcastList.neigbors = make([]string, len(neighbors))
+		for i, n := range neighbors {
+			broadcastList.neigbors[i] = n.(string)
+		}
+		broadcastList.mu.Unlock()
 
 		// Construct reply
 		replyBody = make(map[string]any)
