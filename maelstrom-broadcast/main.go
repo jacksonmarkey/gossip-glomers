@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -12,10 +14,12 @@ type BroadcastList struct {
 	seen     map[int]struct{}
 	neigbors []string
 	mu       sync.Mutex
+	ctx      context.Context
 }
 
 var broadcastList = BroadcastList{
 	seen: make(map[int]struct{}),
+	ctx:  context.Background(),
 }
 
 func main() {
@@ -33,19 +37,18 @@ func main() {
 		_, alreadySeen := broadcastList.seen[i]
 		if !alreadySeen {
 			broadcastList.seen[i] = struct{}{}
-			// TODO: tradeoffs of keeping the lock while we send these RPCs
-			// 1. According to the documentation, Node.Send() shouldn't wait for a response,
-			// so in theory we don't even need to send each in a new goroutine.
-			// 2. We don't want to accidentally change the topology while we're iterating over it.
-			// An alternative would be to copy the topology and iterate over the copy
-			// so we can release the lock earlier, if it's hanging too long.
 			for _, neighbor := range broadcastList.neigbors {
 				if neighbor == n.ID() || neighbor == msg.Src {
 					continue
 				}
 				go func(recipient string) {
-					if err := n.Send(recipient, msgBody); err != nil {
-						panic(err)
+					// repeatedly attempt send at intervals until success
+					for {
+						ctx, cancel := context.WithDeadline(broadcastList.ctx, time.Now().Add(1*time.Second))
+						defer cancel()
+						if _, err := n.SyncRPC(ctx, recipient, msgBody); err == nil {
+							return
+						}
 					}
 				}(neighbor)
 			}
