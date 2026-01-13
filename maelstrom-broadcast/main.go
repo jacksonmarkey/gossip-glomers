@@ -15,6 +15,7 @@ type BroadcastList struct {
 	neigbors []string
 	mu       sync.Mutex
 	ctx      context.Context
+	buffer   []int
 }
 
 var broadcastList = BroadcastList{
@@ -57,26 +58,13 @@ func main() {
 		if err := json.Unmarshal(msg.Body, &msgBody); err != nil {
 			return err
 		}
-		i := int(msgBody["message"].(float64))
-
-		// If we've seen the value before, just return
-		// If we haven't seen it before, record it and send it to all neighbors
-		broadcastList.mu.Lock()
-		_, alreadySeen := broadcastList.seen[i]
-		if !alreadySeen {
-			broadcastList.seen[i] = struct{}{}
-			// Designate root of binary tree to always be forwarded
-			// the broadcast request by whichever node first receives it,
-			// but not by any following nodes to minimize messages per op.
-			neighbors := efficientTopology[n.ID()]
+		if n.ID() == "n0" {
+			broadcastList.mu.Lock()
+			broadcastList.buffer = append(broadcastList.buffer, int(msgBody["message"].(float64)))
+			broadcastList.mu.Unlock()
+		} else {
 			if _, ok := msgBody["propogated"]; !ok {
-				neighbors = append(neighbors, "n0")
-				msgBody["propogated"] = struct{}{}
-			}
-			for _, neighbor := range neighbors {
-				if neighbor == n.ID() || neighbor == msg.Src {
-					continue
-				}
+				neighbor := "n0"
 				go func(recipient string) {
 					// repeatedly attempt send at intervals until success
 					for {
@@ -87,10 +75,29 @@ func main() {
 						}
 					}
 				}(neighbor)
+			} else {
+				buffer := msgBody["buffer"].([]any)
+				broadcastList.mu.Lock()
+				for _, x := range buffer {
+					broadcastList.seen[int(x.(float64))] = struct{}{}
+				}
+
+				neighbors := efficientTopology[n.ID()]
+				for _, neighbor := range neighbors {
+					go func(recipient string) {
+						// repeatedly attempt send at intervals until success
+						for {
+							ctx, cancel := context.WithDeadline(broadcastList.ctx, time.Now().Add(1*time.Second))
+							defer cancel()
+							if _, err := n.SyncRPC(ctx, recipient, msgBody); err == nil {
+								return
+							}
+						}
+					}(neighbor)
+				}
+				broadcastList.mu.Unlock()
 			}
 		}
-		broadcastList.mu.Unlock()
-
 		// Construct reply
 		replyBody = make(map[string]any)
 		replyBody["type"] = "broadcast_ok"
@@ -144,7 +151,53 @@ func main() {
 		return n.Reply(msg, replyBody)
 	})
 
+	go bufferedBroadcast(n)
+
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func bufferedBroadcast(n *maelstrom.Node) {
+	// Once Node.ID() is initialized, exit if we aren't the root node of the tree's topology
+	for {
+		if len(n.ID()) > 0 {
+			if n.ID() == "n0" {
+				break
+			} else {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Intermittently flush the root node's buffer
+	for {
+		broadcastList.mu.Lock()
+		if len(broadcastList.buffer) > 0 {
+			for _, x := range broadcastList.buffer {
+				broadcastList.seen[x] = struct{}{}
+			}
+			msgBody := make(map[string]any)
+			msgBody["type"] = "broadcast"
+			msgBody["buffer"] = broadcastList.buffer
+			msgBody["propogated"] = struct{}{}
+			neighbors := efficientTopology[n.ID()]
+
+			for _, neighbor := range neighbors {
+				go func(recipient string) {
+					// repeatedly attempt send at intervals until success
+					for {
+						ctx, cancel := context.WithDeadline(broadcastList.ctx, time.Now().Add(1*time.Second))
+						defer cancel()
+						if _, err := n.SyncRPC(ctx, recipient, msgBody); err == nil {
+							return
+						}
+					}
+				}(neighbor)
+			}
+			broadcastList.buffer = make([]int, 0)
+		}
+		broadcastList.mu.Unlock()
+		time.Sleep(300 * time.Millisecond)
 	}
 }
