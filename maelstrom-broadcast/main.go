@@ -22,6 +22,34 @@ var broadcastList = BroadcastList{
 	ctx:  context.Background(),
 }
 
+var efficientTopology = map[string][]string{
+	"n0":  []string{"n1", "n2"},
+	"n1":  []string{"n3", "n4"},
+	"n2":  []string{"n5", "n6"},
+	"n3":  []string{"n7", "n8"},
+	"n4":  []string{"n9", "n10"},
+	"n5":  []string{"n11", "n12"},
+	"n6":  []string{"n13", "n14"},
+	"n7":  []string{"n15", "n16"},
+	"n8":  []string{"n17", "n18"},
+	"n9":  []string{"n19", "n20"},
+	"n10": []string{"n21", "n22"},
+	"n11": []string{"n23", "n24"},
+	"n12": []string{},
+	"n13": []string{},
+	"n14": []string{},
+	"n15": []string{},
+	"n16": []string{},
+	"n17": []string{},
+	"n18": []string{},
+	"n19": []string{},
+	"n20": []string{},
+	"n21": []string{},
+	"n22": []string{},
+	"n23": []string{},
+	"n24": []string{},
+}
+
 func main() {
 	n := maelstrom.NewNode()
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
@@ -37,7 +65,15 @@ func main() {
 		_, alreadySeen := broadcastList.seen[i]
 		if !alreadySeen {
 			broadcastList.seen[i] = struct{}{}
-			for _, neighbor := range broadcastList.neigbors {
+			// Designate root of binary tree to always be forwarded
+			// the broadcast request by whichever node first receives it,
+			// but not by any following nodes to minimize messages per op.
+			neighbors := efficientTopology[n.ID()]
+			if _, ok := msgBody["propogated"]; !ok {
+				neighbors = append(neighbors, "n0")
+				msgBody["propogated"] = struct{}{}
+			}
+			for _, neighbor := range neighbors {
 				if neighbor == n.ID() || neighbor == msg.Src {
 					continue
 				}
