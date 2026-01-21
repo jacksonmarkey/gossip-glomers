@@ -1,32 +1,28 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
-	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-type Entry = struct {
-	offset int
-	msg    int
-}
-type LockedLog = struct {
-	commitIndex int
-	nextIndex   int
-	entries     []Entry
-	mu          sync.Mutex
-}
-
 var n *maelstrom.Node
-var logs map[string]*LockedLog
-var createLogLock *sync.Mutex
+var ctx context.Context
+
+var commitIndices *maelstrom.KV
+var nextIndices *maelstrom.KV
+var entries *maelstrom.KV
 
 func main() {
-	createLogLock = &sync.Mutex{}
-	logs = make(map[string]*LockedLog)
 	n = maelstrom.NewNode()
+	ctx = context.Background()
+	commitIndices = maelstrom.NewLinKV(n)
+	nextIndices = maelstrom.NewLinKV(n)
+	entries = maelstrom.NewSeqKV(n)
+
 	n.Handle("send", sendHandler)
 	n.Handle("poll", pollHandler)
 	n.Handle("commit_offsets", commitOffsetsHandler)
@@ -37,38 +33,40 @@ func main() {
 	}
 }
 
-func getOrCreateLog(key string) *LockedLog {
-	log, ok := logs[key]
-	if !ok {
-		createLogLock.Lock()
-		log, ok = logs[key]
-		if !ok {
-			log = &LockedLog{}
-			logs[key] = log
-		}
-		createLogLock.Unlock()
-	}
-	return log
-}
-
 func sendHandler(msg maelstrom.Message) error {
 	var body, replyBody map[string]any
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
 		return err
 	}
-	logKey := body["key"].(string)
+	key := body["key"].(string)
 	logMsg := int(body["msg"].(float64))
 
-	log := getOrCreateLog(logKey)
-	log.mu.Lock()
-	offset := log.nextIndex
-	log.entries = append(log.entries, Entry{offset, logMsg})
-	log.nextIndex += 1
-	log.mu.Unlock()
+	var lastOffset, nextOffset int
+	var err error
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for {
+		// 1 .Get unique offset
+		lastOffset, err = nextIndices.ReadInt(ctx, key)
+		if maelstrom.ErrorCode(err) == maelstrom.KeyDoesNotExist {
+			lastOffset = 0
+		}
+		nextOffset = lastOffset + 1
+		err = nextIndices.CompareAndSwap(ctx, key, lastOffset, nextOffset, true)
+		if maelstrom.ErrorCode(err) == maelstrom.PreconditionFailed {
+			// Our offset is stale, try again from the start
+			continue
+		}
+		// 2. Upload our message under the key-offset composite key
+		keyWithOffset := fmt.Sprintf("%v_%v", key, nextOffset)
+		err = entries.Write(ctx, keyWithOffset, logMsg)
+		break
+	}
 
 	replyBody = make(map[string]any)
 	replyBody["type"] = "send_ok"
-	replyBody["offset"] = offset
+	replyBody["offset"] = nextOffset
 	return n.Reply(msg, replyBody)
 }
 
@@ -78,26 +76,22 @@ func pollHandler(msg maelstrom.Message) error {
 		return err
 	}
 
-	returnMessages := make(map[string][][]int)
+	returnMessages := make(map[string][]any)
 	offsets := body["offsets"].(map[string]any)
-	for logKey, o := range offsets {
-		logMessagesPastOffset := make([][]int, 0)
-		lockedLog, ok := logs[logKey]
-		if ok {
-			lockedLog.mu.Lock()
-			logOffset := int(o.(float64))
-			for i, e := range lockedLog.entries {
-				if e.offset >= logOffset {
-					logMessagesPastOffset = make([][]int, len(lockedLog.entries)-i)
-					for j, e := range lockedLog.entries[i:] {
-						logMessagesPastOffset[j] = []int{e.offset, e.msg}
-					}
-					break
-				}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for key, o := range offsets {
+		logMessagesPastOffset := make([]any, 0, 10)
+		offset := int(o.(float64))
+
+		for i := 0; i < 10; i++ {
+			entryMsg, err := entries.ReadInt(ctx, fmt.Sprintf("%v_%v", key, offset+i))
+			if err == nil {
+				logMessagesPastOffset = append(logMessagesPastOffset, []int{offset + i, entryMsg})
 			}
-			lockedLog.mu.Unlock()
 		}
-		returnMessages[logKey] = logMessagesPastOffset
+		returnMessages[key] = logMessagesPastOffset
 	}
 
 	replyBody = make(map[string]any)
@@ -113,14 +107,25 @@ func commitOffsetsHandler(msg maelstrom.Message) error {
 	}
 
 	offsets := body["offsets"].(map[string]any)
-	for logKey, o := range offsets {
-		logOffset := int(o.(float64))
-		lockedLog := getOrCreateLog(logKey)
-		lockedLog.mu.Lock()
-		if logOffset > lockedLog.commitIndex {
-			lockedLog.commitIndex = logOffset
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for key, o := range offsets {
+		newOffset := int(o.(float64))
+		for {
+			existingOffset, err := commitIndices.ReadInt(ctx, key)
+			if maelstrom.ErrorCode(err) == maelstrom.KeyDoesNotExist {
+				existingOffset = 0
+			}
+			if existingOffset >= newOffset {
+				break
+			}
+			err = commitIndices.CompareAndSwap(ctx, key, existingOffset, newOffset, true)
+			if maelstrom.ErrorCode(err) == maelstrom.PreconditionFailed {
+				continue
+			}
+			break
 		}
-		lockedLog.mu.Unlock()
 	}
 
 	replyBody = make(map[string]any)
@@ -136,14 +141,14 @@ func listCommittedOffsetsHandler(msg maelstrom.Message) error {
 	keys := body["keys"].([]any)
 
 	committedOffsets := make(map[string]int)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	for _, k := range keys {
 		key := k.(string)
-		log, ok := logs[key]
-		if ok {
-			log.mu.Lock()
-			offset := log.commitIndex
-			committedOffsets[key] = offset
-			log.mu.Unlock()
+		commitIndex, err := commitIndices.ReadInt(ctx, key)
+		if err == nil {
+			committedOffsets[key] = commitIndex
 		}
 	}
 
